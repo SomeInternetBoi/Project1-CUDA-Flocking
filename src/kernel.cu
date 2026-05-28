@@ -239,11 +239,45 @@ void Boids::copyBoidsToVBO(float *vbodptr_positions, float *vbodptr_velocities) 
 * Compute the new velocity on the body with index `iSelf` due to the `N` boids
 * in the `pos` and `vel` arrays.
 */
+
 __device__ glm::vec3 computeVelocityChange(int N, int iSelf, const glm::vec3 *pos, const glm::vec3 *vel) {
   // Rule 1: boids fly towards their local perceived center of mass, which excludes themselves
   // Rule 2: boids try to stay a distance d away from each other
   // Rule 3: boids try to match the speed of surrounding boids
-  return glm::vec3(0.0f, 0.0f, 0.0f);
+
+    glm::vec3 rule1 = glm::vec3(0.f); glm::vec3 rule2 = glm::vec3(0.f); glm::vec3 rule3 = glm::vec3(0.f);
+    unsigned numNeighbors1 = 0; unsigned numNeighbors2 = 0; unsigned numNeighbors3 = 0;;
+
+    glm::vec3 thisPos = pos[iSelf];
+    glm::vec3 thisVel = vel[iSelf];
+
+    for (int i = 0; i < N; ++i) { //Check boid i
+        if (i == iSelf) { continue; }
+
+        //I dunno if it makes much of a difference, but perhaps to save redundant global memory reads...
+        glm::vec3 currPos = pos[i];
+        glm::vec3 currVel = vel[i];
+
+        if (glm::length(currPos - thisPos) < rule1Distance) { //Rule 1
+            rule1 += currPos;
+            ++numNeighbors1;
+        }
+        if (glm::length(currPos - thisPos) < rule2Distance) { //Rule 2
+            rule2 -= currPos - thisPos;
+        }
+        if (glm::length(currPos - thisPos) < rule3Distance) { //Rule 3
+            rule3 += currVel;
+            ++numNeighbors3;
+        }
+    }
+
+    rule1 /= float(numNeighbors1);
+    rule1 -= thisPos;
+    rule1 *= rule1Scale;
+    rule2 *= rule2Scale;
+    rule3 *= rule3Scale / float(numNeighbors3);
+  //TODO: Read the paper a bit to figure out what to do with the stuff I computed...
+    return rule1 + rule2 + rule3;
 }
 
 /**
@@ -255,6 +289,19 @@ __global__ void kernUpdateVelocityBruteForce(int N, glm::vec3 *pos,
   // Compute a new velocity based on pos and vel1
   // Clamp the speed
   // Record the new velocity into vel2. Question: why NOT vel1?
+
+    unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) {
+        return;
+    }
+
+    glm::vec3 newVel = computeVelocityChange(N, idx, pos, vel1) + vel1[idx];
+    float newSpeed = glm::length(newVel); //The idea was to reduce the number of floating point ops...dunno if this micro-optimization even matters...
+    if (newSpeed > maxSpeed) {
+        newVel *= maxSpeed / newSpeed;
+    }
+
+    vel2[idx] = newVel;
 }
 
 /**
@@ -356,9 +403,22 @@ __global__ void kernUpdateVelNeighborSearchCoherent(
 /**
 * Step the entire N-body simulation by `dt` seconds.
 */
+
+unsigned divup(unsigned a, unsigned b) {
+    return (a % b == 0) ? (a / b) : (a / b + 1);
+}
+
 void Boids::stepSimulationNaive(float dt) {
   // TODO-1.2 - use the kernels you wrote to step the simulation forward in time.
+    unsigned threadsPerBlock = 1024;
+    unsigned numBlocks = divup(numObjects, threadsPerBlock);
+    //NOTE: I think kernels are executed sequentially on the GPU side from when they're launched...
+    kernUpdateVelocityBruteForce << <numBlocks, threadsPerBlock >> > (numObjects, dev_pos, dev_vel1, dev_vel2);
+    kernUpdatePos<<<numBlocks, threadsPerBlock>>>(numObjects, dt, dev_pos, dev_vel2);
+    
   // TODO-1.2 ping-pong the velocity buffers
+    cudaMemcpy(dev_vel1, dev_vel2, numObjects * sizeof(glm::vec3), cudaMemcpyDeviceToDevice);
+    checkCUDAErrorWithLine("ping pong buffers failed!");
 }
 
 void Boids::stepSimulationScatteredGrid(float dt) {
