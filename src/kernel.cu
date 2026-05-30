@@ -271,11 +271,16 @@ __device__ glm::vec3 computeVelocityChange(int N, int iSelf, const glm::vec3 *po
         }
     }
 
-    rule1 /= float(numNeighbors1);
-    rule1 -= thisPos;
+    //NOTE: check for 0 !!!!
+    if (numNeighbors1 != 0) {
+        rule1 = rule1 / float(numNeighbors1) - thisPos;
+    }
     rule1 *= rule1Scale;
     rule2 *= rule2Scale;
-    rule3 *= rule3Scale / float(numNeighbors3);
+    if (numNeighbors3 != 0) {
+        rule3 /= float(numNeighbors3);
+    }
+    rule3 *= rule3Scale;
   //TODO: Read the paper a bit to figure out what to do with the stuff I computed...
     return rule1 + rule2 + rule3;
 }
@@ -296,10 +301,7 @@ __global__ void kernUpdateVelocityBruteForce(int N, glm::vec3 *pos,
     }
 
     glm::vec3 newVel = computeVelocityChange(N, idx, pos, vel1) + vel1[idx];
-    float newSpeed = glm::length(newVel); //The idea was to reduce the number of floating point ops...dunno if this micro-optimization even matters...
-    if (newSpeed > maxSpeed) {
-        newVel *= maxSpeed / newSpeed;
-    }
+    newVel = glm::length(newVel) <= maxSpeed ? newVel : glm::normalize(newVel) * maxSpeed;
 
     vel2[idx] = newVel;
 }
@@ -417,8 +419,11 @@ void Boids::stepSimulationNaive(float dt) {
     kernUpdatePos<<<numBlocks, threadsPerBlock>>>(numObjects, dt, dev_pos, dev_vel2);
     
   // TODO-1.2 ping-pong the velocity buffers
-    cudaMemcpy(dev_vel1, dev_vel2, numObjects * sizeof(glm::vec3), cudaMemcpyDeviceToDevice);
-    checkCUDAErrorWithLine("ping pong buffers failed!");
+    //cudaMemcpy(dev_vel1, dev_vel2, numObjects * sizeof(glm::vec3), cudaMemcpyDeviceToDevice);
+    glm::vec3* dev_temp = dev_vel1;
+    dev_vel1 = dev_vel2;
+    dev_vel2 = dev_temp;
+    //checkCUDAErrorWithLine("ping pong buffers failed!");
 }
 
 void Boids::stepSimulationScatteredGrid(float dt) {
