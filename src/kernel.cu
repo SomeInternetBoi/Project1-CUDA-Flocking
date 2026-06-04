@@ -370,7 +370,7 @@ __global__ void kernComputeIndices(int N, int gridResolution,
     if (index >= N) { return; }
 
     //TODO: calculate grid index
-    glm::ivec3 offset = glm::floor(pos[index] - gridMin);
+    glm::ivec3 offset = glm::floor((pos[index] - gridMin) * inverseCellWidth);
     int gridIndex = gridIndex3Dto1D(offset.x, offset.y, offset.z, gridResolution);
 
     gridIndices[index] = gridIndex;
@@ -393,10 +393,15 @@ __global__ void kernIdentifyCellStartEnd(int N, int *particleGridIndices,
   // This is basically a parallel unrolling of a loop that goes
   // "this index doesn't match the one before it, must be a new cell!"
 
-    //NOTE: I think I gotta malloc these arrays...
     int startIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (startIdx >= N) { return; }
     int startGridIdx = particleGridIndices[startIdx];
-    if (startIdx == N - 1) { //Array is of odd size
+
+    if (startIdx == 0) { //First grid cell
+        gridCellStartIndices[startGridIdx] = startIdx;
+    }
+
+    if (startIdx == N - 1) { //Last grid cell
         gridCellEndIndices[startGridIdx] = startIdx;
         return;
     }
@@ -427,14 +432,14 @@ __global__ void kernUpdateVelNeighborSearchScattered(
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= N) { return; }
 
-    glm::vec3 thisPos = dev_pos[index];
-    glm::vec3 thisCellFloat = thisPos - gridMinimum * gridInverseCellWidth;
+    glm::vec3 thisPos = pos[index];
+    glm::vec3 thisCellFloat = (thisPos - gridMin) * inverseCellWidth;
     
     //TODO: Compute which grid cells I need to check...
     glm::ivec3 thisCellInt = glm::floor(thisCellFloat);
     
-    glm::ivec3 gridCellLo = glm::clamp(glm::ivec3(glm::round(thisCellFloat - glm::vec3(.5))), glm::ivec3(0), glm::ivec3(gridResolution));
-    glm::ivec3 gridCellHi = glm::clamp(glm::ivec3(gridCellLo + glm::ivec3(1)), glm::ivec3(0), glm::ivec3(gridResolution));
+    glm::ivec3 gridCellLo = glm::clamp(glm::ivec3(glm::floor(thisCellFloat - glm::vec3(.5))), glm::ivec3(0), glm::ivec3(gridResolution - 1));
+    glm::ivec3 gridCellHi = glm::clamp(glm::ivec3(gridCellLo + glm::ivec3(1)), glm::ivec3(0), glm::ivec3(gridResolution - 1));
     
     glm::vec3 rule1 = glm::vec3(0); glm::vec3 rule2 = glm::vec3(0); glm::vec3 rule3 = glm::vec3(0);
     int numNeighbors1 = 0; int numNeighbors3 = 0;
@@ -443,8 +448,8 @@ __global__ void kernUpdateVelNeighborSearchScattered(
     for (int x = gridCellLo.x; x <= gridCellHi.x; ++x) {
         for (int y = gridCellLo.y; y <= gridCellHi.y; ++y) {
             for (int z = gridCellLo.z; z <= gridCellHi.z; ++z) {
-                glm::vec3 currCellMin = gridMinimum + glm::vec3(x, y, z) * gridCellWidth;
-                glm::vec3 currCellMax = currCellMin + glm::vec3(gridCellWidth);
+                glm::vec3 currCellMin = gridMin + glm::vec3(x, y, z) * cellWidth;
+                glm::vec3 currCellMax = currCellMin + glm::vec3(cellWidth);
 
                 glm::vec3 currCellClosest = glm::clamp(thisPos, currCellMin, currCellMax);
                 float currCellDistance = glm::length(thisPos - currCellClosest);
@@ -452,20 +457,26 @@ __global__ void kernUpdateVelNeighborSearchScattered(
                 int currCellIndex = x + y * gridResolution + z * gridResolution * gridResolution;
 
                 //Check all boids in this cell
-                for (int i = dev_gridCellStartIndices[currCellIndex]; i <= dev_gridCellEndIndices[currCellIndex]; ++i) {
-                    glm::vec3 currPos = pos[i];
-                    glm::vec3 currVel = vel1[i];
+                for (int i = gridCellStartIndices[currCellIndex]; i <= gridCellEndIndices[currCellIndex]; ++i) {
+                    if (i == -1) { break; } //Skip if cell doesn't have any boids.
+
+                    int currIndex = particleArrayIndices[i];
+                    if (currIndex == index) { continue; }
+                    glm::vec3 currPos = pos[currIndex];
+                    glm::vec3 currVel = vel1[currIndex];
 
                     if (currCellDistance < rule1Distance && glm::length(currPos - thisPos) < rule1Distance) {
-
+                        rule1 += currPos;
+                        ++numNeighbors1;
                     }
 
                     if (currCellDistance < rule2Distance && glm::length(currPos - thisPos) < rule2Distance) {
-
+                        rule2 -= currPos - thisPos;
                     }
 
                     if (currCellDistance < rule3Distance && glm::length(currPos - thisPos) < rule3Distance) {
-
+                        rule3 += currVel;
+                        ++numNeighbors3;
                     }
 
                 }
@@ -485,7 +496,8 @@ __global__ void kernUpdateVelNeighborSearchScattered(
     }
     rule3 *= rule3Scale;
     //TODO: Read the paper a bit to figure out what to do with the stuff I computed...
-    vel2[index] = vel1[index] + rule1 + rule2 + rule3;
+    glm::vec3 unclampedVel = vel1[index] + rule1 + rule2 + rule3;
+    vel2[index] = glm::length(unclampedVel) > maxSpeed ? glm::normalize(unclampedVel) * maxSpeed : unclampedVel;
 }
 
 __global__ void kernUpdateVelNeighborSearchCoherent(
@@ -570,11 +582,24 @@ void Boids::stepSimulationScatteredGrid(float dt) {
 #endif
 
     unsigned numBlocksToComputeIndices = divup(gridCellCount, blockSize);
+    //NOTE: Reset the arrays before each step!
+    kernResetIntBuffer << <numBlocksToComputeIndices, blockSize >> > (gridCellCount, dev_gridCellStartIndices, -1);
+    kernResetIntBuffer << <numBlocksToComputeIndices, blockSize >> > (gridCellCount, dev_gridCellEndIndices, -1);
     //void kernIdentifyCellStartEnd(int N, int *particleGridIndices, int* gridCellStartIndices, int* gridCellEndIndices)
-    kernIdentifyCellStartEnd<<<numBlocksToComputeIndices, blockSize >>> (numObjects, dev_particleGridIndices,
+    kernIdentifyCellStartEnd<<<numBlocks, blockSize >>> (numObjects, dev_particleGridIndices,
         dev_gridCellStartIndices, dev_gridCellEndIndices);
 
     //TODO: Launch kernel for updating velocity
+    /*void kernUpdateVelNeighborSearchScattered(
+        int N, int gridResolution, glm::vec3 gridMin,
+        float inverseCellWidth, float cellWidth,
+        int* gridCellStartIndices, int* gridCellEndIndices,
+        int* particleArrayIndices,
+        glm::vec3 * pos, glm::vec3 * vel1, glm::vec3 * vel2)*/
+    kernUpdateVelNeighborSearchScattered << <numBlocks, blockSize >> > (numObjects, gridSideCount, gridMinimum,
+        gridInverseCellWidth, gridCellWidth,
+        dev_gridCellStartIndices, dev_gridCellEndIndices, dev_particleArrayIndices,
+        dev_pos, dev_vel1, dev_vel2);
 
     kernUpdatePos << <numBlocks, blockSize >> > (numObjects, dt, dev_pos, dev_vel2);
 
